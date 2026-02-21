@@ -1,0 +1,60 @@
+# Conduit LLM Gateway Configuration
+# Copy to conduit.yaml and customize.
+# Environment variables override all values here.
+# Format: CONDUIT_<SECTION>__<KEY> (double underscore for nesting)
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+
+database:
+  url: "postgresql+asyncpg://conduit:conduit_dev@localhost:5432/conduit"
+  pool_size: 20
+  max_overflow: 10
+  echo: false
+
+redis:
+  url: "redis://localhost:6379/0"
+  key_prefix: "conduit:"
+
+auth:
+  # Master admin key, used to bootstrap the system.
+  # Generate one via: python scripts/generate_key.py
+  master_api_key: ""
+
+logging:
+  level: "INFO"   # DEBUG | INFO | WARNING | ERROR
+  format: "json"  # json | console
+
+# Provider Deployments
+# These can also be managed via the Admin API at runtime.
+providers:
+  - name: "openai-gpt4o"
+    provider: "openai"
+    model_name: "gpt-4o"
+    api_key: "${OPENAI_API_KEY}"
+    api_base: "https://api.openai.com/v1"
+    priority: 1
+    is_active: true
+
+  - name: "openai-gpt4o-mini"
+    provider: "openai"
+    model_name: "gpt-4o-mini"
+    api_key: "${OPENAI_API_KEY}"
+    api_base: "https://api.openai.com/v1"
+    priority: 1
+    is_active: true
+
+# Routing
+routing:
+  default_strategy: "priority"  # priority | cost | latency | round_robin
+  fallback_enabled: true
+  max_retries: 2
+  retry_delay_ms: 500
+
+# Cache
+cache:
+  enabled: false
+  default_ttl_seconds: 3600
+  semantic_threshold: 0.95  # Cosine similarity threshold

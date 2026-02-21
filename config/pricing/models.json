@@ -1,0 +1,40 @@
+{
+  "_comment": "Cost per 1 million tokens (USD). Updated periodically.",
+  "models": {
+    "gpt-5.2": {
+      "provider": "openai",
+      "input_cost_per_1m": 2.50,
+      "output_cost_per_1m": 10.00
+    },
+    "claude-4.5-sonnet-20251122": {
+      "provider": "anthropic",
+      "input_cost_per_1m": 3.00,
+      "output_cost_per_1m": 15.00
+    },
+    "claude-4.5-opus-20251122": {
+      "provider": "anthropic",
+      "input_cost_per_1m": 15.00,
+      "output_cost_per_1m": 75.00
+    },
+    "gemini-3-pro": {
+      "provider": "google",
+      "input_cost_per_1m": 1.25,
+      "output_cost_per_1m": 5.00
+    },
+    "gemini-3-flash": {
+      "provider": "google",
+      "input_cost_per_1m": 0.075,
+      "output_cost_per_1m": 0.30
+    },
+    "mistral-large-latest": {
+      "provider": "mistral",
+      "input_cost_per_1m": 2.00,
+      "output_cost_per_1m": 6.00
+    },
+    "deepseek-chat": {
+      "provider": "deepseek",
+      "input_cost_per_1m": 0.14,
+      "output_cost_per_1m": 0.28
+    }
+  }
+}
