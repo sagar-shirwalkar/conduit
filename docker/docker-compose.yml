@@ -1,9 +1,8 @@
 name: conduit
 
 services:
-  # PostgreSQL
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: conduit
       POSTGRES_PASSWORD: conduit_dev
@@ -18,19 +17,17 @@ services:
       timeout: 3s
       retries: 5
 
-  # Redis
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # Conduit Gateway
   conduit:
     build:
       context: ..
@@ -43,6 +40,8 @@ services:
       CONDUIT_REDIS__URL: redis://redis:6379/0
       CONDUIT_MASTER_API_KEY: cnd_admin_dev_key_do_not_use_in_prod
       CONDUIT_LOG_LEVEL: DEBUG
+      CONDUIT_CACHE__ENABLED: "true"
+      CONDUIT_GUARDRAILS__ENABLED: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -56,6 +55,8 @@ services:
     volumes:
       - ../src:/app/src:ro
       - ../config:/app/config:ro
+      - conduit-models:/home/conduit/.cache
 
 volumes:
   pgdata:
+  conduit-models:

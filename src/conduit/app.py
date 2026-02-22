@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from conduit import __version__
 from conduit.api.admin.router import admin_router
@@ -18,6 +19,9 @@ from conduit.common.errors import register_error_handlers
 from conduit.common.logging import configure_logging
 from conduit.config import get_settings
 from conduit.db.session import engine, async_session_factory
+from conduit.providers import registry as providers_registry
+from conduit.providers.registry import close_http_client
+from conduit.core.auth.rate_limiter import get_rate_limiter
 
 
 logger = structlog.stdlib.get_logger()
@@ -25,7 +29,6 @@ logger = structlog.stdlib.get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Application startup and shutdown lifecycle."""
     settings = get_settings()
     configure_logging(settings.logging.level, settings.logging.format)
 
@@ -34,19 +37,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "conduit.startup",
         version=__version__,
         env=settings.env,
-        database=settings.database.url.split("@")[-1],  # Hide credentials
+        database=settings.database.url.split("@")[-1],
+        cache_enabled=settings.cache.enabled,
+        guardrails_enabled=settings.guardrails.enabled,
     )
 
-    # Store on app state for dependency injection
+    # Pre-load embedding model if cache is enabled
+    if settings.cache.enabled:
+        try:
+            from conduit.core.cache.embedding import get_embedding_model
+            get_embedding_model(settings.cache.embedding_model)
+            await log.ainfo("conduit.embedding_model.loaded", model=settings.cache.embedding_model)
+        except Exception as e:
+            await log.awarning("conduit.embedding_model.failed", error=str(e))
+
+    # Enable pgvector extension
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        await log.ainfo("conduit.pgvector.enabled")
+    except Exception as e:
+        await log.awarning("conduit.pgvector.failed", error=str(e))
+
     app.state.settings = settings
     app.state.db_session_factory = async_session_factory
 
     yield
 
-    # Shutdown
+    await close_http_client()
+    try:
+        rl = get_rate_limiter()
+        await rl.close()
+    except Exception:
+        pass
+
     await engine.dispose()
     await log.ainfo("conduit.shutdown")
-
 
 def create_app() -> FastAPI:
     """Application factory — called by Uvicorn."""

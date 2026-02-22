@@ -27,23 +27,76 @@ logging:
   level: "INFO"   # DEBUG | INFO | WARNING | ERROR
   format: "json"  # json | console
 
+rate_limit:
+  enabled: true
+  default_rpm: 60       # Default requests per minute per key
+  default_tpm: 100000   # Default tokens per minute per key
+
+# Semantic Cache
+cache:
+  enabled: true
+  default_ttl_seconds: 3600
+  semantic_threshold: 0.95          # Cosine similarity (0.95 = very strict)
+  embedding_model: "BAAI/bge-small-en-v1.5"  # 45MB, 384 dim, ONNX
+  embedding_dimension: 384
+  max_entries: 100000
+  exact_match_ttl_seconds: 600      # Redis fast-path TTL
+
+# Guardrails
+guardrails:
+  enabled: true
+  pii_enabled: true                 # Detect emails, phones, ID, CC, etc.
+  injection_enabled: true           # Detect prompt injection attempts
+  content_filter_enabled: true      # Keyword blocklist filtering
+  default_action: "block"           # block | redact | warn
+  max_input_length: 100000
+
+# Prompt Templates
+prompts:
+  enabled: true
+  max_template_size: 50000
+
 # Provider Deployments
 # These can also be managed via the Admin API at runtime.
 providers:
-  - name: "openai-gpt4o"
+  - name: "openai-gpt5"
     provider: "openai"
-    model_name: "gpt-4o"
+    model_name: "gpt-5.2"
     api_key: "${OPENAI_API_KEY}"
     api_base: "https://api.openai.com/v1"
     priority: 1
     is_active: true
 
-  - name: "openai-gpt4o-mini"
+  - name: "openai-gpt5-mini"
     provider: "openai"
-    model_name: "gpt-4o-mini"
+    model_name: "gpt-5.2-mini"
     api_key: "${OPENAI_API_KEY}"
     api_base: "https://api.openai.com/v1"
     priority: 1
+    is_active: true
+
+  - name: "anthropic-sonnet"
+    provider: "anthropic"
+    model_name: "claude-4-6-sonnet-20241022"
+    api_key: "${ANTHROPIC_API_KEY}"
+    api_base: "https://api.anthropic.com"
+    priority: 1
+    is_active: true
+
+  - name: "gemini-pro"
+    provider: "google"
+    model_name: "gemini-3-pro"
+    api_key: "${GOOGLE_API_KEY}"
+    api_base: "https://generativelanguage.googleapis.com"
+    priority: 1
+    is_active: true
+
+  - name: "gemini-flash"
+    provider: "google"
+    model_name: "gemini-3-flash"
+    api_key: "${GOOGLE_API_KEY}"
+    api_base: "https://generativelanguage.googleapis.com"
+    priority: 2
     is_active: true
 
 # Routing
@@ -52,9 +105,3 @@ routing:
   fallback_enabled: true
   max_retries: 2
   retry_delay_ms: 500
-
-# Cache
-cache:
-  enabled: false
-  default_ttl_seconds: 3600
-  semantic_threshold: 0.95  # Cosine similarity threshold

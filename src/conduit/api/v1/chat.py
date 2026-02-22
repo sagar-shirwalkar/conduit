@@ -1,8 +1,8 @@
 """
 POST /v1/chat/completions — Core proxy endpoint.
 
-Accepts OpenAI-compatible requests, routes them through:
-  Auth → Rate Limit → Guardrails → Cache → Router → Provider → Log
+Supports both streaming (SSE) and non-streaming responses.
+Full pipeline: Auth -> Rate Limit -> Route -> Provider -> Cost -> Log
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from conduit.api.deps import AuthenticatedKey, DBSession
 from conduit.schemas.completion import ChatCompletionRequest, ChatCompletionResponse
@@ -25,9 +25,11 @@ router = APIRouter()
 @router.post(
     "/chat/completions",
     response_model=ChatCompletionResponse,
-    response_class=ORJSONResponse,
     summary="Create chat completion",
-    description="OpenAI-compatible chat completion endpoint. Routes to configured providers.",
+    description=(
+        "OpenAI-compatible chat completion endpoint. "
+        "Routes to configured providers. Supports streaming via SSE."
+    ),
 )
 async def create_chat_completion(
     body: ChatCompletionRequest,
@@ -35,7 +37,7 @@ async def create_chat_completion(
     api_key: AuthenticatedKey,
     db: DBSession,
     service: Annotated[CompletionService, Depends(get_completion_service)],
-) -> ORJSONResponse:
+) -> ORJSONResponse | StreamingResponse:
     request_id = getattr(request.state, "request_id", "unknown")
 
     await logger.ainfo(
@@ -46,33 +48,45 @@ async def create_chat_completion(
         api_key_prefix=api_key.key_prefix,
     )
 
-    # TODO Phase 2: streaming support
     if body.stream:
-        # For now, return an error for streaming requests
-        return ORJSONResponse(
-            status_code=501,
-            content={
-                "error": {
-                    "message": "Streaming is not yet supported. Coming in Phase 2.",
-                    "type": "not_implemented",
-                    "code": 501,
-                }
+        # Streaming SSE
+        sse_generator, headers = await service.create_streaming_completion(
+            request=body,
+            api_key=api_key,
+            request_id=request_id,
+            db=db,
+        )
+
+        return StreamingResponse(
+            content=sse_generator,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering
+                "x-conduit-request-id": request_id,
+                **headers,
             },
         )
 
-    result = await service.create_completion(
-        request=body,
-        api_key=api_key,
-        request_id=request_id,
-        db=db,
-    )
+    else:
+        # Non-Streaming
+        result = await service.create_completion(
+            request=body,
+            api_key=api_key,
+            request_id=request_id,
+            db=db,
+        )
 
-    response = ORJSONResponse(content=result.response.model_dump())
+        response = ORJSONResponse(content=result.response.model_dump())
 
-    # Conduit metadata headers
-    response.headers["x-conduit-cache"] = "HIT" if result.cached else "MISS"
-    response.headers["x-conduit-cost-usd"] = str(result.cost_usd)
-    response.headers["x-conduit-provider"] = result.provider
-    response.headers["x-conduit-request-id"] = request_id
+        response.headers["x-conduit-cache"] = "HIT" if result.cached else "MISS"
+        response.headers["x-conduit-cost-usd"] = str(result.cost_usd)
+        response.headers["x-conduit-provider"] = result.provider
+        response.headers["x-conduit-request-id"] = request_id
 
-    return response
+        # Rate limit headers
+        for key, value in result.rate_limit_headers.items():
+            response.headers[key] = value
+
+        return response

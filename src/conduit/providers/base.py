@@ -6,7 +6,9 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
 import httpx
+import structlog
 
+from conduit.common.errors import ProviderError
 from conduit.models.deployment import ModelDeployment
 from conduit.schemas.completion import (
     ChatCompletionChunk,
@@ -14,16 +16,18 @@ from conduit.schemas.completion import (
     ChatCompletionResponse,
 )
 
+logger = structlog.stdlib.get_logger()
+
 
 class ProviderAdapter(ABC):
     """
     Base class for all LLM provider adapters.
 
-    Each adapter handles:
-      1. Transforming Conduit's OpenAI-compatible request → provider's native format
-      2. Making the HTTP call
-      3. Transforming the provider's response → OpenAI-compatible format
-      4. Mapping provider errors → Conduit's error taxonomy
+    Subclasses must implement:
+      - transform_request() : convert to provider's native format
+      - transform_response() : convert back to OpenAI format
+      - send() : non-streaming completion
+      - stream() : async iterator of SSE chunks
     """
 
     provider_name: str
@@ -37,12 +41,7 @@ class ProviderAdapter(ABC):
         request: ChatCompletionRequest,
         deployment: ModelDeployment,
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
-        """
-        Transform a Conduit request into a provider-native request.
-
-        Returns:
-            (url, headers, body)
-        """
+        """Returns (url, headers, body) for the provider's API."""
         ...
 
     @abstractmethod
@@ -51,7 +50,16 @@ class ProviderAdapter(ABC):
         raw_response: dict[str, Any],
         model: str,
     ) -> ChatCompletionResponse:
-        """Transform a provider response into an OpenAI-compatible response."""
+        """Transform provider response → OpenAI-compatible response."""
+        ...
+
+    @abstractmethod
+    async def send(
+        self,
+        request: ChatCompletionRequest,
+        deployment: ModelDeployment,
+    ) -> ChatCompletionResponse:
+        """Send a non-streaming completion request."""
         ...
 
     @abstractmethod
@@ -60,13 +68,47 @@ class ProviderAdapter(ABC):
         request: ChatCompletionRequest,
         deployment: ModelDeployment,
     ) -> AsyncIterator[ChatCompletionChunk]:
-        """Yield OpenAI-compatible SSE chunks from the provider's stream."""
-        ...  # pragma: no cover
-        # Make this a valid async generator
+        """Yield OpenAI-compatible SSE chunks."""
+        ...
         if False:
-            yield  # type: ignore[misc]
+            yield  # type: ignore[misc]  # pragma: no cover
 
     def extract_usage(self, raw_response: dict[str, Any]) -> tuple[int, int]:
         """Extract (prompt_tokens, completion_tokens) from provider response."""
         usage = raw_response.get("usage", {})
         return usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+
+    async def _handle_error_response(
+        self,
+        response: httpx.Response,
+        deployment: ModelDeployment,
+    ) -> None:
+        """Shared error handling for non-2xx responses."""
+        error_body = response.text
+        await logger.aerror(
+            f"provider.{self.provider_name}.error",
+            status_code=response.status_code,
+            body=error_body[:500],
+            deployment=deployment.name,
+        )
+
+        # Map provider status codes to appropriate Conduit errors
+        if response.status_code == 401:
+            raise ProviderError(
+                f"{self.provider_name} authentication failed for deployment '{deployment.name}'",
+                details={"provider": self.provider_name, "status_code": 401},
+            )
+        if response.status_code == 429:
+            raise ProviderError(
+                f"{self.provider_name} rate limit exceeded on deployment '{deployment.name}'",
+                details={"provider": self.provider_name, "status_code": 429, "retry": True},
+            )
+
+        raise ProviderError(
+            f"{self.provider_name} returned {response.status_code}: {error_body[:200]}",
+            details={
+                "provider": self.provider_name,
+                "status_code": response.status_code,
+                "deployment": deployment.name,
+            },
+        )

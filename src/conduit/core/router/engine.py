@@ -1,8 +1,8 @@
 """
-Router engine — selects the best deployment for a request.
+Router engine — selects deployments and manages fallback chains.
 
-Phase 1: Simple priority-based routing with fallback.
-Phase 2 will add: latency-based, cost-based, weighted round-robin.
+The router returns an ordered list of deployments to try. The
+completion service iterates through them, falling back on failure.
 """
 
 from __future__ import annotations
@@ -14,105 +14,101 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conduit.common.errors import NoHealthyDeploymentError
+from conduit.config import get_settings
+from conduit.core.router.health import CircuitBreaker
+from conduit.core.router.strategies import get_strategy
 from conduit.models.deployment import ModelDeployment
 
 logger = structlog.stdlib.get_logger()
 
 
 class RouterEngine:
-    """Selects the optimal deployment for a given model request."""
+    """Selects and ranks deployments for a given model request."""
+
+    def __init__(
+        self,
+        strategy_name: str | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
+        settings = get_settings()
+        self.strategy_name = strategy_name or settings.routing.default_strategy
+        self.fallback_enabled = settings.routing.fallback_enabled
+        self.max_retries = settings.routing.max_retries
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
 
     async def route(
         self,
         model: str,
         db: AsyncSession,
-    ) -> ModelDeployment:
+    ) -> list[ModelDeployment]:
         """
-        Find the best healthy deployment for the requested model.
+        Find and rank all viable deployments for the requested model.
 
-        Strategy (Phase 1 — priority):
-          1. Find all active deployments matching the model
-          2. Filter out unhealthy / cooled-down deployments
-          3. Return highest-priority (lowest number) deployment
+        Returns:
+            Ordered list of deployments to try (best first).
+            The completion service will iterate with fallback.
 
         Raises:
-            NoHealthyDeploymentError: If no deployment is available
+            NoHealthyDeploymentError: If no deployment is available.
         """
-        now = datetime.now(timezone.utc)
-
         result = await db.execute(
             select(ModelDeployment)
             .where(
                 ModelDeployment.model_name == model,
                 ModelDeployment.is_active.is_(True),
             )
-            .order_by(ModelDeployment.priority.asc())
         )
-        deployments = list(result.scalars().all())
+        all_deployments = list(result.scalars().all())
 
-        if not deployments:
+        if not all_deployments:
             raise NoHealthyDeploymentError(
                 f"No deployments configured for model '{model}'. "
                 f"Register one via POST /admin/v1/models/deployments"
             )
 
-        # Filter healthy deployments
-        healthy = [
-            d
-            for d in deployments
-            if d.is_healthy and (d.cooldown_until is None or d.cooldown_until < now)
-        ]
+        # Filter through circuit breaker
+        available = [d for d in all_deployments if self.circuit_breaker.is_available(d)]
 
-        if not healthy:
+        if not available:
             raise NoHealthyDeploymentError(
                 f"All deployments for model '{model}' are currently unhealthy. "
-                f"Total deployments: {len(deployments)}"
+                f"Total deployments: {len(all_deployments)}, "
+                f"all in cooldown."
             )
 
-        chosen = healthy[0]
+        # Apply routing strategy to rank available deployments
+        strategy = get_strategy(self.strategy_name)
+        ranked = strategy.rank(available)
+
+        # Limit to max_retries + 1 (first attempt + retries)
+        if not self.fallback_enabled:
+            ranked = ranked[:1]
+        else:
+            ranked = ranked[: self.max_retries + 1]
 
         await logger.ainfo(
-            "router.selected",
+            "router.ranked",
             model=model,
-            deployment=chosen.name,
-            provider=chosen.provider.value,
-            priority=chosen.priority,
-            candidates=len(healthy),
+            strategy=self.strategy_name,
+            candidates=[d.name for d in ranked],
+            total_available=len(available),
+            total_configured=len(all_deployments),
         )
 
-        return chosen
+        return ranked
 
-    async def mark_failure(
+    async def record_success(
         self,
         deployment: ModelDeployment,
         db: AsyncSession,
     ) -> None:
-        """Mark a deployment as having failed (for circuit breaking)."""
-        deployment.consecutive_failures += 1
+        """Record a successful request."""
+        await self.circuit_breaker.record_success(deployment, db)
 
-        # Simple circuit breaker: cool down after 3 consecutive failures
-        if deployment.consecutive_failures >= 3:
-            from datetime import timedelta
-
-            deployment.is_healthy = False
-            deployment.cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=60)
-            await logger.awarning(
-                "router.circuit_open",
-                deployment=deployment.name,
-                failures=deployment.consecutive_failures,
-                cooldown_until=deployment.cooldown_until.isoformat(),
-            )
-
-        await db.flush()
-
-    async def mark_success(
+    async def record_failure(
         self,
         deployment: ModelDeployment,
         db: AsyncSession,
     ) -> None:
-        """Reset failure counters on successful request."""
-        if deployment.consecutive_failures > 0:
-            deployment.consecutive_failures = 0
-            deployment.is_healthy = True
-            deployment.cooldown_until = None
-            await db.flush()
+        """Record a failed request."""
+        await self.circuit_breaker.record_failure(deployment, db)

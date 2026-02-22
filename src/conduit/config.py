@@ -76,10 +76,34 @@ class RoutingSettings(BaseModel):
     retry_delay_ms: int = 500
 
 
+class RateLimitSettings(BaseModel):
+    enabled: bool = True
+    default_rpm: int = 60
+    default_tpm: int = 100_000
+
+
 class CacheSettings(BaseModel):
     enabled: bool = False
     default_ttl_seconds: int = 3600
     semantic_threshold: float = 0.95
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_dimension: int = 384
+    max_entries: int = 100_000
+    exact_match_ttl_seconds: int = 600  # Redis exact-match TTL
+
+
+class GuardrailSettings(BaseModel):
+    enabled: bool = False
+    pii_enabled: bool = True
+    injection_enabled: bool = True
+    content_filter_enabled: bool = True
+    default_action: str = "block"  # block | redact | warn
+    max_input_length: int = 100_000  # Max characters in input
+
+
+class PromptSettings(BaseModel):
+    enabled: bool = True
+    max_template_size: int = 50_000
 
 
 class Settings(BaseSettings):
@@ -100,20 +124,20 @@ class Settings(BaseSettings):
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     providers: list[ProviderDeploymentConfig] = Field(default_factory=list)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)
+    prompts: PromptSettings = Field(default_factory=PromptSettings)
 
-    # Convenience aliases for flat env vars
+    # Convenience flat env vars
     master_api_key: str = ""
     log_level: str = ""
 
     def model_post_init(self, __context: Any) -> None:
-        # Allow flat env vars to override nested ones
         if self.master_api_key:
             self.auth.master_api_key = self.master_api_key
         if self.log_level:
             self.logging.level = LogLevel(self.log_level.upper())
-
-        # Resolve ${ENV_VAR} references in provider API keys
         for provider in self.providers:
             if provider.api_key.startswith("${") and provider.api_key.endswith("}"):
                 env_var = provider.api_key[2:-1]
@@ -121,7 +145,6 @@ class Settings(BaseSettings):
 
 
 def _load_yaml_config() -> dict[str, Any]:
-    """Load YAML config file if it exists."""
     search_paths = [
         Path("conduit.yaml"),
         Path("config/conduit.yaml"),
@@ -137,6 +160,5 @@ def _load_yaml_config() -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Get cached settings instance."""
     yaml_data = _load_yaml_config()
     return Settings(**yaml_data)

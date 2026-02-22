@@ -1,4 +1,4 @@
-"""OpenAI provider adapter (also works for Azure OpenAI)."""
+"""OpenAI provider adapter (also supports Azure OpenAI)."""
 
 from __future__ import annotations
 
@@ -42,14 +42,12 @@ class OpenAIAdapter(ProviderAdapter):
             "Content-Type": "application/json",
         }
 
-        # Build body — only include non-None fields
         body: dict[str, Any] = {
             "model": deployment.model_name,
             "messages": [m.model_dump(exclude_none=True) for m in request.messages],
         }
 
-        # Optional parameters
-        optional_fields = {
+        optional_fields: dict[str, Any] = {
             "temperature": request.temperature,
             "top_p": request.top_p,
             "n": request.n,
@@ -69,6 +67,10 @@ class OpenAIAdapter(ProviderAdapter):
             if value is not None:
                 body[key] = value
 
+        # Request usage in final streaming chunk
+        if request.stream:
+            body["stream_options"] = {"include_usage": True}
+
         return url, headers, body
 
     def transform_response(
@@ -76,7 +78,6 @@ class OpenAIAdapter(ProviderAdapter):
         raw_response: dict[str, Any],
         model: str,
     ) -> ChatCompletionResponse:
-        """OpenAI response is already in our target format — minimal transform."""
         choices = []
         for raw_choice in raw_response.get("choices", []):
             msg = raw_choice.get("message", {})
@@ -111,16 +112,12 @@ class OpenAIAdapter(ProviderAdapter):
         request: ChatCompletionRequest,
         deployment: ModelDeployment,
     ) -> ChatCompletionResponse:
-        """Send a non-streaming request to OpenAI."""
         url, headers, body = self.transform_request(request, deployment)
+        body["stream"] = False
+        body.pop("stream_options", None)
 
         try:
-            response = await self.client.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=120.0,
-            )
+            response = await self.client.post(url, headers=headers, json=body, timeout=120.0)
         except httpx.TimeoutException as e:
             raise ProviderError(
                 f"OpenAI request timed out: {e}",
@@ -133,43 +130,50 @@ class OpenAIAdapter(ProviderAdapter):
             ) from e
 
         if response.status_code != 200:
-            error_body = response.text
-            await logger.aerror(
-                "provider.openai.error",
-                status_code=response.status_code,
-                body=error_body[:500],
-                deployment=deployment.name,
-            )
-            raise ProviderError(
-                f"OpenAI returned {response.status_code}: {error_body[:200]}",
-                details={
-                    "provider": "openai",
-                    "status_code": response.status_code,
-                    "deployment": deployment.name,
-                },
-            )
+            await self._handle_error_response(response, deployment)
 
-        raw = response.json()
-        return self.transform_response(raw, request.model)
+        return self.transform_response(response.json(), request.model)
 
     async def stream(
         self,
         request: ChatCompletionRequest,
         deployment: ModelDeployment,
     ) -> AsyncIterator[ChatCompletionChunk]:
-        """Stream chunks from OpenAI (Phase 2)."""
         url, headers, body = self.transform_request(request, deployment)
         body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
 
-        async with self.client.stream("POST", url, headers=headers, json=body, timeout=120.0) as resp:
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    event = json.loads(data)
+        try:
+            async with self.client.stream(
+                "POST", url, headers=headers, json=body, timeout=120.0
+            ) as response:
+                if response.status_code != 200:
+                    # Read the full error body for non-streaming error
+                    await response.aread()
+                    await self._handle_error_response(response, deployment)
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    # Extract usage from final chunk if present
+                    raw_usage = event.get("usage")
+                    usage = None
+                    if raw_usage:
+                        usage = Usage(
+                            prompt_tokens=raw_usage.get("prompt_tokens", 0),
+                            completion_tokens=raw_usage.get("completion_tokens", 0),
+                            total_tokens=raw_usage.get("total_tokens", 0),
+                        )
+
                     yield ChatCompletionChunk(
                         id=event.get("id", ""),
                         created=event.get("created", int(time.time())),
@@ -182,6 +186,11 @@ class OpenAIAdapter(ProviderAdapter):
                             )
                             for c in event.get("choices", [])
                         ],
+                        usage=usage,
                     )
-                except json.JSONDecodeError:
-                    continue
+
+        except httpx.TimeoutException as e:
+            raise ProviderError(
+                f"OpenAI stream timed out: {e}",
+                details={"provider": "openai", "deployment": deployment.name},
+            ) from e
